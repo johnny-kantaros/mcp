@@ -55,10 +55,19 @@ class MCPClient:
 
     async def process_query(self, query: str) -> str:
         """Process a query using Claude and available tools"""
-        messages = [{"role": "user", "content": query}]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant. If a relevant function is available, always use the function call system "
+                    "instead of explaining it. Do not describe or suggest function calls — just call the function directly."
+                )
+            },
+            {"role": "user", "content": query}
+        ]
 
+        # Step 1: List available tools
         response = await self.session.list_tools()
-
         functions = []
 
         for tool in response.tools:
@@ -71,50 +80,66 @@ class MCPClient:
             }
             functions.append(function)
 
-        response = self.gpt_client.responses.create(
-            model="gpt-4", input=messages, tools=functions
-        )
-
-        # Process response and handle tool calls
         final_text = []
-        assistant_message_content = []
 
-        for output in response.output:
+        while True:
+            # Step 2: Get model response
+            response = self.gpt_client.responses.create(
+                model="gpt-4",
+                input=messages,
+                tools=functions,
+                tool_choice="auto",
+            )
+
+            # Step 3: Handle model output
+            output = response.output[0]  # Assuming one response per round
+
             if output.type == "message":
-                response_content = output.content
-                for message in response_content:
-                    final_text.append(message.text)
-                    assistant_message_content.append(response_content)
+                message_content = output.content[0].text
+                final_text.append(message_content)
+                break
+
             elif output.type == "function_call":
+                # 3a. Prepare assistant tool call message
+                assistant_message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": output.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": output.name,
+                                "arguments": output.arguments
+                            }
+                        }
+                    ]
+                }
+                messages.append(assistant_message)
+
+                # 3b. Execute the actual tool
                 tool_name = output.name
                 tool_args = json.loads(output.arguments)
-
-                # Execute tool call
-                tool_message = None
                 result = await self.session.call_tool(tool_name, tool_args)
+
+                # Extract text from tool result
+                tool_result_text = ""
                 for content in result.content:
                     if isinstance(content, TextContent):
-                        tool_message = content.text
+                        tool_result_text += content.text
                     else:
-                        tool_message = str(content)
+                        tool_result_text += str(content)
 
-                    assistant_message_content.append(tool_message)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                # 3c. Append tool output message
+                tool_output_message = {
+                    "role": "tool",
+                    "tool_call_id": output.call_id,
+                    "content": tool_result_text
+                }
+                messages.append(tool_output_message)
 
-                # Tool call
-                messages.append(output)
-                messages.append({
-                    "type": "function_call_output",
-                    "call_id": output.call_id,
-                    "output": str(result)
-                })
-
-                response = self.gpt_client.responses.create(
-                    model="gpt-4", input=messages, tools=functions
-                )
-
-                final_text.append(response.output[0].content[0].text)
-                print(final_text[-1])
+            else:
+                raise RuntimeError(f"Unexpected output type: {output.type}")
 
         return "\n".join(final_text)
 
